@@ -15,6 +15,11 @@
 (define-constant ERR_ALREADY_VOTED (err u108))
 (define-constant ERR_CLAIM_NOT_FOUND (err u109))
 (define-constant ERR_INSUFFICIENT_VOTES (err u110))
+(define-constant ERR_ORACLE_NOT_AUTHORIZED (err u111))
+(define-constant ERR_WEATHER_DATA_NOT_FOUND (err u112))
+(define-constant ERR_INVALID_WEATHER_DATA (err u113))
+(define-constant ERR_ORACLE_ALREADY_EXISTS (err u114))
+(define-constant ERR_WEATHER_TRIGGER_NOT_MET (err u115))
 
 (define-data-var next-policy-id uint u1)
 (define-data-var next-claim-id uint u1)
@@ -22,6 +27,9 @@
 (define-data-var min-premium uint u1000000)
 (define-data-var max-coverage uint u100000000)
 (define-data-var voting-period uint u144)
+(define-data-var next-weather-report-id uint u1)
+(define-data-var oracle-registration-fee uint u5000000)
+(define-data-var weather-data-validity-period uint u144)
 
 (define-map policies
   { policy-id: uint }
@@ -68,6 +76,58 @@
 (define-map dao-members
   { member: principal }
   { stake: uint, voting-power: uint, joined-block: uint }
+)
+
+(define-map weather-oracles
+  { oracle-id: principal }
+  {
+    name: (string-ascii 50),
+    registration-block: uint,
+    stake: uint,
+    reputation-score: uint,
+    total-reports: uint,
+    active: bool
+  }
+)
+
+(define-map weather-reports
+  { report-id: uint }
+  {
+    oracle-id: principal,
+    location: (string-ascii 100),
+    temperature: int,
+    humidity: uint,
+    precipitation: uint,
+    wind-speed: uint,
+    weather-condition: (string-ascii 30),
+    timestamp: uint,
+    block-height: uint,
+    verified: bool
+  }
+)
+
+(define-map policy-weather-triggers
+  { policy-id: uint }
+  {
+    min-temperature: int,
+    max-temperature: int,
+    max-wind-speed: uint,
+    max-precipitation: uint,
+    trigger-conditions: (list 10 (string-ascii 30)),
+    monitoring-active: bool,
+    last-checked-block: uint
+  }
+)
+
+(define-map weather-claims
+  { claim-id: uint }
+  {
+    policy-id: uint,
+    weather-report-id: uint,
+    trigger-type: (string-ascii 30),
+    auto-triggered: bool,
+    trigger-block: uint
+  }
 )
 
 (define-public (join-dao (stake-amount uint))
@@ -293,4 +353,222 @@
     policy (and (get active policy) (<= stacks-block-height (get end-block policy)))
     false
   )
+)
+
+(define-public (register-weather-oracle (oracle-name (string-ascii 50)))
+  (let
+    (
+      (registration-fee (var-get oracle-registration-fee))
+      (current-balance (stx-get-balance tx-sender))
+      (existing-oracle (map-get? weather-oracles { oracle-id: tx-sender }))
+    )
+    (asserts! (is-none existing-oracle) ERR_ORACLE_ALREADY_EXISTS)
+    (asserts! (>= current-balance registration-fee) ERR_INSUFFICIENT_FUNDS)
+    (asserts! (> (len oracle-name) u0) ERR_INVALID_AMOUNT)
+    
+    (try! (stx-transfer? registration-fee tx-sender (as-contract tx-sender)))
+    (var-set treasury-balance (+ (var-get treasury-balance) registration-fee))
+    
+    (map-set weather-oracles
+      { oracle-id: tx-sender }
+      {
+        name: oracle-name,
+        registration-block: stacks-block-height,
+        stake: registration-fee,
+        reputation-score: u100,
+        total-reports: u0,
+        active: true
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (submit-weather-report (location (string-ascii 100)) (temperature int) (humidity uint) (precipitation uint) (wind-speed uint) (weather-condition (string-ascii 30)))
+  (let
+    (
+      (oracle-info (unwrap! (map-get? weather-oracles { oracle-id: tx-sender }) ERR_ORACLE_NOT_AUTHORIZED))
+      (report-id (var-get next-weather-report-id))
+    )
+    (asserts! (get active oracle-info) ERR_ORACLE_NOT_AUTHORIZED)
+    (asserts! (> (len location) u0) ERR_INVALID_WEATHER_DATA)
+    (asserts! (<= humidity u100) ERR_INVALID_WEATHER_DATA)
+    (asserts! (> (len weather-condition) u0) ERR_INVALID_WEATHER_DATA)
+    
+    (map-set weather-reports
+      { report-id: report-id }
+      {
+        oracle-id: tx-sender,
+        location: location,
+        temperature: temperature,
+        humidity: humidity,
+        precipitation: precipitation,
+        wind-speed: wind-speed,
+        weather-condition: weather-condition,
+        timestamp: (unwrap-panic (get-stacks-block-info? time stacks-block-height)),
+        block-height: stacks-block-height,
+        verified: false
+      }
+    )
+    
+    (map-set weather-oracles
+      { oracle-id: tx-sender }
+      (merge oracle-info { total-reports: (+ (get total-reports oracle-info) u1) })
+    )
+    
+    (var-set next-weather-report-id (+ report-id u1))
+    (ok report-id)
+  )
+)
+
+(define-public (verify-weather-report (report-id uint))
+  (let
+    (
+      (report (unwrap! (map-get? weather-reports { report-id: report-id }) ERR_WEATHER_DATA_NOT_FOUND))
+      (oracle-info (unwrap! (map-get? weather-oracles { oracle-id: (get oracle-id report) }) ERR_ORACLE_NOT_AUTHORIZED))
+      (voter-info (unwrap! (map-get? dao-members { member: tx-sender }) ERR_NOT_AUTHORIZED))
+    )
+    (asserts! (not (get verified report)) ERR_CLAIM_ALREADY_PROCESSED)
+    (asserts! (>= (get voting-power voter-info) u1) ERR_NOT_AUTHORIZED)
+    
+    (map-set weather-reports
+      { report-id: report-id }
+      (merge report { verified: true })
+    )
+    
+    (map-set weather-oracles
+      { oracle-id: (get oracle-id report) }
+      (merge oracle-info { reputation-score: (+ (get reputation-score oracle-info) u10) })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (set-policy-weather-triggers (policy-id uint) (min-temp int) (max-temp int) (max-wind uint) (max-precip uint) (conditions (list 10 (string-ascii 30))))
+  (let
+    (
+      (policy (unwrap! (map-get? policies { policy-id: policy-id }) ERR_POLICY_NOT_FOUND))
+    )
+    (asserts! (is-eq (get farmer policy) tx-sender) ERR_NOT_AUTHORIZED)
+    (asserts! (get active policy) ERR_POLICY_EXPIRED)
+    (asserts! (< min-temp max-temp) ERR_INVALID_WEATHER_DATA)
+    
+    (map-set policy-weather-triggers
+      { policy-id: policy-id }
+      {
+        min-temperature: min-temp,
+        max-temperature: max-temp,
+        max-wind-speed: max-wind,
+        max-precipitation: max-precip,
+        trigger-conditions: conditions,
+        monitoring-active: true,
+        last-checked-block: stacks-block-height
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (check-weather-triggers (policy-id uint) (weather-report-id uint))
+  (let
+    (
+      (policy (unwrap! (map-get? policies { policy-id: policy-id }) ERR_POLICY_NOT_FOUND))
+      (weather-report (unwrap! (map-get? weather-reports { report-id: weather-report-id }) ERR_WEATHER_DATA_NOT_FOUND))
+      (weather-triggers (unwrap! (map-get? policy-weather-triggers { policy-id: policy-id }) ERR_WEATHER_DATA_NOT_FOUND))
+      (claim-id (var-get next-claim-id))
+    )
+    (asserts! (get active policy) ERR_POLICY_EXPIRED)
+    (asserts! (get verified weather-report) ERR_INVALID_WEATHER_DATA)
+    (asserts! (get monitoring-active weather-triggers) ERR_WEATHER_TRIGGER_NOT_MET)
+    (asserts! (is-eq (get location policy) (get location weather-report)) ERR_INVALID_WEATHER_DATA)
+    
+    (let
+      (
+        (temperature (get temperature weather-report))
+        (wind-speed (get wind-speed weather-report))
+        (precipitation (get precipitation weather-report))
+        (weather-condition (get weather-condition weather-report))
+        (trigger-met (or
+          (< temperature (get min-temperature weather-triggers))
+          (> temperature (get max-temperature weather-triggers))
+          (> wind-speed (get max-wind-speed weather-triggers))
+          (> precipitation (get max-precipitation weather-triggers))
+          (is-some (index-of (get trigger-conditions weather-triggers) weather-condition))
+        ))
+      )
+      (asserts! trigger-met ERR_WEATHER_TRIGGER_NOT_MET)
+      
+      (map-set claims
+        { claim-id: claim-id }
+        {
+          policy-id: policy-id,
+          farmer: (get farmer policy),
+          damage-percentage: u80,
+          evidence-hash: "weather-auto-trigger",
+          claim-amount: (/ (* (get coverage policy) u80) u100),
+          status: "weather-triggered",
+          votes-for: u0,
+          votes-against: u0,
+          voting-end-block: (+ stacks-block-height (var-get voting-period)),
+          processed: false
+        }
+      )
+      
+      (map-set weather-claims
+        { claim-id: claim-id }
+        {
+          policy-id: policy-id,
+          weather-report-id: weather-report-id,
+          trigger-type: weather-condition,
+          auto-triggered: true,
+          trigger-block: stacks-block-height
+        }
+      )
+      
+      (var-set next-claim-id (+ claim-id u1))
+      (ok claim-id)
+    )
+  )
+)
+
+(define-public (deactivate-oracle (oracle-id principal))
+  (let
+    (
+      (oracle-info (unwrap! (map-get? weather-oracles { oracle-id: oracle-id }) ERR_ORACLE_NOT_AUTHORIZED))
+      (caller-dao-info (unwrap! (map-get? dao-members { member: tx-sender }) ERR_NOT_AUTHORIZED))
+    )
+    (asserts! (>= (get voting-power caller-dao-info) u5) ERR_NOT_AUTHORIZED)
+    (asserts! (get active oracle-info) ERR_ORACLE_NOT_AUTHORIZED)
+    
+    (map-set weather-oracles
+      { oracle-id: oracle-id }
+      (merge oracle-info { active: false })
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-weather-oracle (oracle-id principal))
+  (map-get? weather-oracles { oracle-id: oracle-id })
+)
+
+(define-read-only (get-weather-report (report-id uint))
+  (map-get? weather-reports { report-id: report-id })
+)
+
+(define-read-only (get-policy-weather-triggers (policy-id uint))
+  (map-get? policy-weather-triggers { policy-id: policy-id })
+)
+
+(define-read-only (get-weather-claim (claim-id uint))
+  (map-get? weather-claims { claim-id: claim-id })
+)
+
+(define-read-only (get-weather-stats)
+  {
+    next-weather-report-id: (var-get next-weather-report-id),
+    oracle-registration-fee: (var-get oracle-registration-fee),
+    weather-data-validity-period: (var-get weather-data-validity-period)
+  }
 )
