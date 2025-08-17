@@ -20,6 +20,11 @@
 (define-constant ERR_INVALID_WEATHER_DATA (err u113))
 (define-constant ERR_ORACLE_ALREADY_EXISTS (err u114))
 (define-constant ERR_WEATHER_TRIGGER_NOT_MET (err u115))
+(define-constant ERR_POOL_NOT_FOUND (err u116))
+(define-constant ERR_INSUFFICIENT_POOL_BALANCE (err u117))
+(define-constant ERR_POOL_LOCKED (err u118))
+(define-constant ERR_MINIMUM_STAKE_NOT_MET (err u119))
+(define-constant ERR_NO_REWARDS_AVAILABLE (err u120))
 
 (define-data-var next-policy-id uint u1)
 (define-data-var next-claim-id uint u1)
@@ -30,6 +35,11 @@
 (define-data-var next-weather-report-id uint u1)
 (define-data-var oracle-registration-fee uint u5000000)
 (define-data-var weather-data-validity-period uint u144)
+(define-data-var next-pool-id uint u1)
+(define-data-var min-pool-stake uint u10000000)
+(define-data-var pool-reward-rate uint u500)
+(define-data-var total-premium-collected uint u0)
+(define-data-var total-claims-paid uint u0)
 
 (define-map policies
   { policy-id: uint }
@@ -130,6 +140,46 @@
   }
 )
 
+(define-map insurance-pools
+  { pool-id: uint }
+  {
+    name: (string-ascii 50),
+    total-staked: uint,
+    total-stakers: uint,
+    premium-share: uint,
+    created-block: uint,
+    locked-until-block: uint,
+    active: bool,
+    total-rewards-distributed: uint
+  }
+)
+
+(define-map pool-stakes
+  { pool-id: uint, staker: principal }
+  {
+    amount: uint,
+    stake-block: uint,
+    last-reward-block: uint,
+    total-rewards-earned: uint
+  }
+)
+
+(define-map staker-pools
+  { staker: principal }
+  { pool-ids: (list 20 uint) }
+)
+
+(define-map pool-performance
+  { pool-id: uint }
+  {
+    premiums-earned: uint,
+    claims-covered: uint,
+    net-profit: uint,
+    performance-score: uint,
+    last-updated-block: uint
+  }
+)
+
 (define-public (join-dao (stake-amount uint))
   (let
     (
@@ -165,6 +215,7 @@
     
     (try! (stx-transfer? premium tx-sender (as-contract tx-sender)))
     (var-set treasury-balance (+ (var-get treasury-balance) premium))
+    (var-set total-premium-collected (+ (var-get total-premium-collected) premium))
     
     (map-set policies
       { policy-id: policy-id }
@@ -268,6 +319,7 @@
         (asserts! (>= (var-get treasury-balance) (get claim-amount claim)) ERR_INSUFFICIENT_FUNDS)
         (try! (as-contract (stx-transfer? (get claim-amount claim) tx-sender (get farmer claim))))
         (var-set treasury-balance (- (var-get treasury-balance) (get claim-amount claim)))
+        (var-set total-claims-paid (+ (var-get total-claims-paid) (get claim-amount claim)))
         (map-set claims
           { claim-id: claim-id }
           (merge claim { status: "approved", processed: true })
@@ -572,3 +624,243 @@
     weather-data-validity-period: (var-get weather-data-validity-period)
   }
 )
+
+(define-public (create-insurance-pool (pool-name (string-ascii 50)) (premium-share uint) (lock-period uint))
+  (let
+    (
+      (pool-id (var-get next-pool-id))
+      (caller-dao-info (unwrap! (map-get? dao-members { member: tx-sender }) ERR_NOT_AUTHORIZED))
+    )
+    (asserts! (>= (get voting-power caller-dao-info) u3) ERR_NOT_AUTHORIZED)
+    (asserts! (> (len pool-name) u0) ERR_INVALID_AMOUNT)
+    (asserts! (<= premium-share u10000) ERR_INVALID_AMOUNT)
+    (asserts! (> lock-period u0) ERR_INVALID_AMOUNT)
+    
+    (map-set insurance-pools
+      { pool-id: pool-id }
+      {
+        name: pool-name,
+        total-staked: u0,
+        total-stakers: u0,
+        premium-share: premium-share,
+        created-block: stacks-block-height,
+        locked-until-block: (+ stacks-block-height lock-period),
+        active: true,
+        total-rewards-distributed: u0
+      }
+    )
+    
+    (map-set pool-performance
+      { pool-id: pool-id }
+      {
+        premiums-earned: u0,
+        claims-covered: u0,
+        net-profit: u0,
+        performance-score: u100,
+        last-updated-block: stacks-block-height
+      }
+    )
+    
+    (var-set next-pool-id (+ pool-id u1))
+    (ok pool-id)
+  )
+)
+
+(define-public (stake-in-pool (pool-id uint) (stake-amount uint))
+  (let
+    (
+      (pool (unwrap! (map-get? insurance-pools { pool-id: pool-id }) ERR_POOL_NOT_FOUND))
+      (current-balance (stx-get-balance tx-sender))
+      (existing-stake (map-get? pool-stakes { pool-id: pool-id, staker: tx-sender }))
+      (existing-pools (default-to { pool-ids: (list) } (map-get? staker-pools { staker: tx-sender })))
+    )
+    (asserts! (get active pool) ERR_POOL_LOCKED)
+    (asserts! (>= stake-amount (var-get min-pool-stake)) ERR_MINIMUM_STAKE_NOT_MET)
+    (asserts! (>= current-balance stake-amount) ERR_INSUFFICIENT_FUNDS)
+    
+    (try! (stx-transfer? stake-amount tx-sender (as-contract tx-sender)))
+    (var-set treasury-balance (+ (var-get treasury-balance) stake-amount))
+    
+    (match existing-stake
+      current-stake
+      (map-set pool-stakes
+        { pool-id: pool-id, staker: tx-sender }
+        (merge current-stake { amount: (+ (get amount current-stake) stake-amount) })
+      )
+      (begin
+        (map-set pool-stakes
+          { pool-id: pool-id, staker: tx-sender }
+          {
+            amount: stake-amount,
+            stake-block: stacks-block-height,
+            last-reward-block: stacks-block-height,
+            total-rewards-earned: u0
+          }
+        )
+        (map-set insurance-pools
+          { pool-id: pool-id }
+          (merge pool { total-stakers: (+ (get total-stakers pool) u1) })
+        )
+        (map-set staker-pools
+          { staker: tx-sender }
+          { pool-ids: (unwrap! (as-max-len? (append (get pool-ids existing-pools) pool-id) u20) ERR_INVALID_AMOUNT) }
+        )
+      )
+    )
+    
+    (map-set insurance-pools
+      { pool-id: pool-id }
+      (merge pool { total-staked: (+ (get total-staked pool) stake-amount) })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (withdraw-from-pool (pool-id uint) (withdraw-amount uint))
+  (let
+    (
+      (pool (unwrap! (map-get? insurance-pools { pool-id: pool-id }) ERR_POOL_NOT_FOUND))
+      (stake-info (unwrap! (map-get? pool-stakes { pool-id: pool-id, staker: tx-sender }) ERR_INSUFFICIENT_FUNDS))
+    )
+    (asserts! (>= stacks-block-height (get locked-until-block pool)) ERR_POOL_LOCKED)
+    (asserts! (>= (get amount stake-info) withdraw-amount) ERR_INSUFFICIENT_FUNDS)
+    (asserts! (>= (var-get treasury-balance) withdraw-amount) ERR_INSUFFICIENT_POOL_BALANCE)
+    
+    (try! (as-contract (stx-transfer? withdraw-amount tx-sender tx-sender)))
+    (var-set treasury-balance (- (var-get treasury-balance) withdraw-amount))
+    
+    (let ((new-amount (- (get amount stake-info) withdraw-amount)))
+      (if (is-eq new-amount u0)
+        (begin
+          (map-delete pool-stakes { pool-id: pool-id, staker: tx-sender })
+          (map-set insurance-pools
+            { pool-id: pool-id }
+            (merge pool { 
+              total-staked: (- (get total-staked pool) withdraw-amount),
+              total-stakers: (- (get total-stakers pool) u1)
+            })
+          )
+        )
+        (begin
+          (map-set pool-stakes
+            { pool-id: pool-id, staker: tx-sender }
+            (merge stake-info { amount: new-amount })
+          )
+          (map-set insurance-pools
+            { pool-id: pool-id }
+            (merge pool { total-staked: (- (get total-staked pool) withdraw-amount) })
+          )
+        )
+      )
+    )
+    (ok withdraw-amount)
+  )
+)
+
+(define-public (distribute-pool-rewards (pool-id uint))
+  (let
+    (
+      (pool (unwrap! (map-get? insurance-pools { pool-id: pool-id }) ERR_POOL_NOT_FOUND))
+      (performance (unwrap! (map-get? pool-performance { pool-id: pool-id }) ERR_POOL_NOT_FOUND))
+      (total-premiums (var-get total-premium-collected))
+      (pool-premium-share (/ (* total-premiums (get premium-share pool)) u10000))
+      (reward-rate (var-get pool-reward-rate))
+      (pool-rewards (/ (* pool-premium-share reward-rate) u10000))
+    )
+    (asserts! (get active pool) ERR_POOL_LOCKED)
+    (asserts! (> (get total-staked pool) u0) ERR_NO_REWARDS_AVAILABLE)
+    (asserts! (>= (var-get treasury-balance) pool-rewards) ERR_INSUFFICIENT_FUNDS)
+    
+    (map-set pool-performance
+      { pool-id: pool-id }
+      (merge performance {
+        premiums-earned: (+ (get premiums-earned performance) pool-premium-share),
+        net-profit: (+ (get net-profit performance) pool-rewards),
+        last-updated-block: stacks-block-height
+      })
+    )
+    
+    (map-set insurance-pools
+      { pool-id: pool-id }
+      (merge pool { total-rewards-distributed: (+ (get total-rewards-distributed pool) pool-rewards) })
+    )
+    
+    (ok pool-rewards)
+  )
+)
+
+(define-public (claim-pool-rewards (pool-id uint))
+  (let
+    (
+      (pool (unwrap! (map-get? insurance-pools { pool-id: pool-id }) ERR_POOL_NOT_FOUND))
+      (stake-info (unwrap! (map-get? pool-stakes { pool-id: pool-id, staker: tx-sender }) ERR_INSUFFICIENT_FUNDS))
+      (performance (unwrap! (map-get? pool-performance { pool-id: pool-id }) ERR_POOL_NOT_FOUND))
+      (stake-percentage (/ (* (get amount stake-info) u10000) (get total-staked pool)))
+      (total-rewards (get total-rewards-distributed pool))
+      (staker-reward (/ (* total-rewards stake-percentage) u10000))
+      (unclaimed-reward (- staker-reward (get total-rewards-earned stake-info)))
+    )
+    (asserts! (> unclaimed-reward u0) ERR_NO_REWARDS_AVAILABLE)
+    (asserts! (>= (var-get treasury-balance) unclaimed-reward) ERR_INSUFFICIENT_FUNDS)
+    
+    (try! (as-contract (stx-transfer? unclaimed-reward tx-sender tx-sender)))
+    (var-set treasury-balance (- (var-get treasury-balance) unclaimed-reward))
+    
+    (map-set pool-stakes
+      { pool-id: pool-id, staker: tx-sender }
+      (merge stake-info { 
+        total-rewards-earned: (+ (get total-rewards-earned stake-info) unclaimed-reward),
+        last-reward-block: stacks-block-height
+      })
+    )
+    
+    (ok unclaimed-reward)
+  )
+)
+
+(define-public (deactivate-pool (pool-id uint))
+  (let
+    (
+      (pool (unwrap! (map-get? insurance-pools { pool-id: pool-id }) ERR_POOL_NOT_FOUND))
+      (caller-dao-info (unwrap! (map-get? dao-members { member: tx-sender }) ERR_NOT_AUTHORIZED))
+    )
+    (asserts! (>= (get voting-power caller-dao-info) u5) ERR_NOT_AUTHORIZED)
+    (asserts! (get active pool) ERR_POOL_LOCKED)
+    
+    (map-set insurance-pools
+      { pool-id: pool-id }
+      (merge pool { active: false })
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-insurance-pool (pool-id uint))
+  (map-get? insurance-pools { pool-id: pool-id })
+)
+
+(define-read-only (get-pool-stake (pool-id uint) (staker principal))
+  (map-get? pool-stakes { pool-id: pool-id, staker: staker })
+)
+
+(define-read-only (get-staker-pools (staker principal))
+  (map-get? staker-pools { staker: staker })
+)
+
+(define-read-only (get-pool-performance (pool-id uint))
+  (map-get? pool-performance { pool-id: pool-id })
+)
+
+(define-read-only (get-pool-stats)
+  {
+    next-pool-id: (var-get next-pool-id),
+    min-pool-stake: (var-get min-pool-stake),
+    pool-reward-rate: (var-get pool-reward-rate),
+    total-premium-collected: (var-get total-premium-collected),
+    total-claims-paid: (var-get total-claims-paid)
+  }
+)
+
+
+
